@@ -1804,8 +1804,15 @@ func (tunnel *Tunnel) operateTunnel(tunnelOwner TunnelOwner) {
 
 		// Schedule an almost-immediate status request to deliver any unreported
 		// persistent stats or perform a server entry prune check.
-		unreported := CountUnreportedPersistentStats()
-		isCheckDue := IsCheckServerEntryTagsDue(tunnel.config)
+
+		// MODIFIED: Use tunnel.config.DataStore
+		unreported := 0
+		isCheckDue := false
+		if tunnel.config.DataStore != nil {
+			unreported = tunnel.config.DataStore.CountUnreportedPersistentStats()
+			isCheckDue = tunnel.config.DataStore.IsCheckServerEntryTagsDue(tunnel.config)
+		}
+
 		if unreported > 0 || isCheckDue {
 			NoticeInfo(
 				"Unreported persistent stats: %d; server entry check due: %v",
@@ -2244,14 +2251,18 @@ loop:
 
 			if resetOnFailure {
 				NoticeInfo("Delete dial parameters for %s", tunnel.dialParams.ServerEntry.GetDiagnosticID())
-				err := DeleteDialParameters(tunnel.dialParams.ServerEntry.IpAddress, tunnel.dialParams.NetworkID)
-				if err != nil {
-					NoticeWarning("DeleteDialParameters failed: %s", err)
-				}
-				NoticeInfo("Delete server affinity for %s", tunnel.dialParams.ServerEntry.GetDiagnosticID())
-				err = DeleteServerEntryAffinity(tunnel.dialParams.ServerEntry.IpAddress)
-				if err != nil {
-					NoticeWarning("DeleteServerEntryAffinity failed: %s", err)
+
+				// MODIFIED: Use tunnel.config.DataStore
+				if tunnel.config.DataStore != nil {
+					err := tunnel.config.DataStore.DeleteDialParameters(tunnel.dialParams.ServerEntry.IpAddress, tunnel.dialParams.NetworkID)
+					if err != nil {
+						NoticeWarning("DeleteDialParameters failed: %s", err)
+					}
+					NoticeInfo("Delete server affinity for %s", tunnel.dialParams.ServerEntry.GetDiagnosticID())
+					err = tunnel.config.DataStore.DeleteServerEntryAffinity(tunnel.dialParams.ServerEntry.IpAddress)
+					if err != nil {
+						NoticeWarning("DeleteServerEntryAffinity failed: %s", err)
+					}
 				}
 			}
 		}

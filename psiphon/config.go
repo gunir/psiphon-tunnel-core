@@ -71,6 +71,7 @@ const (
 // corresponding fields are int pointers. nil means no value was supplied and
 // to use the default; a non-nil pointer to 0 means no timeout.
 type Config struct {
+	DataStore *DataStore `json:"-"`
 
 	// DataRootDirectory is the directory in which to store persistent files,
 	// which contain information such as server entries. By default, current

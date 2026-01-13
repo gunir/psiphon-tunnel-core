@@ -456,11 +456,10 @@ func NewInproxyBrokerClientInstance(
 	// data when available. Otherwise, SelectCandidateWithNetworkReplayParameters
 	// iterates over the shuffled candidates and returns the first with replay data.
 
+	// Replay broker dial parameters.
 	var brokerSpec *parameters.InproxyBrokerSpec
 	var brokerDialParams *InproxyBrokerDialParameters
 
-	// Replay is disabled when the TTL, InproxyReplayBrokerDialParametersTTL,
-	// is 0.
 	now := time.Now()
 	ttl := p.Duration(parameters.InproxyReplayBrokerDialParametersTTL)
 
@@ -469,21 +468,23 @@ func NewInproxyBrokerClientInstance(
 		prng.FlipWeightedCoin(p.Float(parameters.InproxyReplayBrokerDialParametersProbability))
 
 	if replayEnabled {
-		brokerSpec, brokerDialParams, err =
-			SelectCandidateWithNetworkReplayParameters[parameters.InproxyBrokerSpec, InproxyBrokerDialParameters](
-				networkID,
-				selectFirstCandidate,
-				brokerSpecs,
-				func(spec *parameters.InproxyBrokerSpec) string { return spec.BrokerPublicKey },
-				func(spec *parameters.InproxyBrokerSpec, dialParams *InproxyBrokerDialParameters) bool {
-					// Replay the successful broker spec, if present, by
-					// comparing its hash with that of the candidate.
-					return dialParams.LastUsedTimestamp.After(now.Add(-ttl)) &&
-						bytes.Equal(dialParams.LastUsedBrokerSpecHash, hashBrokerSpec(spec))
-				})
-		if err != nil {
-			NoticeWarning("SelectCandidateWithNetworkReplayParameters failed: %v", errors.Trace(err))
-			// Continue without replay
+		// MODIFIED: Pass config.DataStore
+		if config.DataStore != nil {
+			brokerSpec, brokerDialParams, err =
+				SelectCandidateWithNetworkReplayParameters[parameters.InproxyBrokerSpec, InproxyBrokerDialParameters](
+					config.DataStore,
+					networkID,
+					selectFirstCandidate,
+					brokerSpecs,
+					func(spec *parameters.InproxyBrokerSpec) string { return spec.BrokerPublicKey },
+					func(spec *parameters.InproxyBrokerSpec, dialParams *InproxyBrokerDialParameters) bool {
+						return dialParams.LastUsedTimestamp.After(now.Add(-ttl)) &&
+							bytes.Equal(dialParams.LastUsedBrokerSpecHash, hashBrokerSpec(spec))
+					})
+			if err != nil {
+				NoticeWarning("SelectCandidateWithNetworkReplayParameters failed: %v", errors.Trace(err))
+				// Continue without replay
+			}
 		}
 	}
 
@@ -705,7 +706,11 @@ func haveInproxyCommonCompartmentIDs(config *Config) bool {
 	if len(p.InproxyCompartmentIDs(parameters.InproxyCommonCompartmentIDs)) > 0 {
 		return true
 	}
-	commonCompartmentIDs, _ := LoadInproxyCommonCompartmentIDs()
+	// MODIFIED: Call method on DataStore
+	if config.DataStore == nil {
+		return false
+	}
+	commonCompartmentIDs, _ := config.DataStore.LoadInproxyCommonCompartmentIDs()
 	return len(commonCompartmentIDs) > 0
 }
 
@@ -783,10 +788,15 @@ func prepareInproxyCompartmentIDs(
 
 		tacticsCommonCompartmentIDs := p.InproxyCompartmentIDs(parameters.InproxyCommonCompartmentIDs)
 
-		knownCommonCompartmentIDs, err := LoadInproxyCommonCompartmentIDs()
-		if err != nil {
-			NoticeWarning("LoadInproxyCommonCompartmentIDs failed: %v", errors.Trace(err))
-			// Continue with only the tactics common compartment IDs.
+		// MODIFIED: Call method on DataStore
+		var knownCommonCompartmentIDs []string
+		if config.DataStore != nil {
+			var err error
+			knownCommonCompartmentIDs, err = config.DataStore.LoadInproxyCommonCompartmentIDs()
+			if err != nil {
+				NoticeWarning("LoadInproxyCommonCompartmentIDs failed: %v", errors.Trace(err))
+				// Continue with only the tactics common compartment IDs.
+			}
 		}
 
 		newCompartmentIDs := make([]string, 0, len(tacticsCommonCompartmentIDs))
@@ -816,10 +826,12 @@ func prepareInproxyCompartmentIDs(
 				newCompartmentIDs = newCompartmentIDs[:maxPersistedCommonCompartmentIDListLength]
 			}
 
-			err := StoreInproxyCommonCompartmentIDs(newCompartmentIDs)
-			if err != nil {
-				NoticeWarning("StoreInproxyCommonCompartmentIDs failed: %v", errors.Trace(err))
-				// Continue without persisting new common compartment IDs.
+			// MODIFIED: Call method on DataStore
+			if config.DataStore != nil {
+				err := config.DataStore.StoreInproxyCommonCompartmentIDs(newCompartmentIDs)
+				if err != nil {
+					NoticeWarning("StoreInproxyCommonCompartmentIDs failed: %v", errors.Trace(err))
+				}
 			}
 
 			knownCommonCompartmentIDs = newCompartmentIDs
@@ -920,9 +932,6 @@ func (b *InproxyBrokerClientInstance) BrokerClientRoundTripperSucceeded(roundTri
 	defer b.mutex.Unlock()
 
 	if rt, ok := roundTripper.(*InproxyBrokerRoundTripper); !ok || rt != b.roundTripper {
-		// Passing in the round tripper obtained from BrokerClientRoundTripper
-		// is just used for sanity check in this implementation, since each
-		// InproxyBrokerClientInstance has exactly one round tripper.
 		NoticeError("BrokerClientRoundTripperSucceeded: roundTripper instance mismatch")
 		return
 	}
@@ -930,21 +939,20 @@ func (b *InproxyBrokerClientInstance) BrokerClientRoundTripperSucceeded(roundTri
 	now := time.Now()
 	b.lastSuccess = now
 
-	// Set replay or extend the broker dial parameters replay TTL after a
-	// success. With tunnel dial parameters, the replay TTL is extended after
-	// every successful tunnel connection. Since there are potentially more
-	// and more frequent broker round trips compared to tunnel dials, the TTL
-	// is only extended after some target duration has elapsed, to avoid
-	// excessive datastore writes.
-
 	if b.replayEnabled && now.Sub(b.lastStoreReplay) > b.replayUpdateFrequency {
 		b.brokerDialParams.LastUsedTimestamp = time.Now()
 
-		err := SetNetworkReplayParameters[InproxyBrokerDialParameters](
-			b.networkID, b.brokerDialParams.brokerSpec.BrokerPublicKey, b.brokerDialParams)
+		// MODIFIED: Pass b.config.DataStore
+		var err error
+		if b.config.DataStore != nil {
+			err = SetNetworkReplayParameters[InproxyBrokerDialParameters](
+				b.config.DataStore, b.networkID, b.brokerDialParams.brokerSpec.BrokerPublicKey, b.brokerDialParams)
+		} else {
+			err = errors.TraceNew("DataStore not available")
+		}
+
 		if err != nil {
 			NoticeWarning("StoreBrokerDialParameters failed: %v", errors.Trace(err))
-			// Continue without persisting replay changes.
 		} else {
 			b.lastStoreReplay = now
 		}
@@ -1028,19 +1036,17 @@ func (b *InproxyBrokerClientInstance) BrokerClientRoundTripperFailed(roundTrippe
 	if b.replayEnabled &&
 		!prng.FlipWeightedCoin(b.replayRetainFailedProbability) {
 
-		// Limitation: there's a race condition with multiple
-		// InproxyBrokerClientInstances writing to the replay datastore for
-		// the same broker, such as in the case where there's a dual-mode
-		// in-proxy client and proxy; this delete could potentially clobber a
-		// concurrent fresh replay store after a success.
-		//
-		// TODO: add an additional storage key distinguisher for each instance?
+		// MODIFIED: Pass b.config.DataStore
+		var err error
+		if b.config.DataStore != nil {
+			err = DeleteNetworkReplayParameters[InproxyBrokerDialParameters](
+				b.config.DataStore, b.networkID, b.brokerDialParams.brokerSpec.BrokerPublicKey)
+		} else {
+			err = errors.TraceNew("DataStore not available")
+		}
 
-		err := DeleteNetworkReplayParameters[InproxyBrokerDialParameters](
-			b.networkID, b.brokerDialParams.brokerSpec.BrokerPublicKey)
 		if err != nil {
 			NoticeWarning("DeleteBrokerDialParameters failed: %v", errors.Trace(err))
-			// Continue without resetting replay.
 		}
 	}
 

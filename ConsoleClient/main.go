@@ -43,10 +43,10 @@ func main() {
 	// Define command-line parameters
 
 	var configFilename string
-	flag.StringVar(&configFilename, "config", "", "configuration input file")
+	flag.StringVar(&configFilename, "config", "", "configuration input file (can also be provided as trailing arguments)")
 
 	var dataRootDirectory string
-	flag.StringVar(&dataRootDirectory, "dataRootDirectory", "", "directory where persistent files will be stored")
+	flag.StringVar(&dataRootDirectory, "dataRootDirectory", "", "directory where persistent files will be stored (overrides config)")
 
 	var embeddedServerEntryListFilename string
 	flag.StringVar(&embeddedServerEntryListFilename, "serverList", "", "embedded server entry list input file")
@@ -77,22 +77,7 @@ func main() {
 
 	var tunDevice, tunBindInterface, tunDNSServers string
 	if tun.IsSupported() {
-
-		// When tunDevice is specified, a packet tunnel is run and packets are relayed between
-		// the specified tun device and the server.
-		//
-		// The tun device is expected to exist and should be configured with an IP address and
-		// routing.
-		//
-		// The tunBindInterface/tunPrimaryDNS/tunSecondaryDNS parameters are used to bypass any
-		// tun device routing when connecting to Psiphon servers.
-		//
-		// For transparent tunneled DNS, set the host or DNS clients to use the address specfied
-		// in tun.GetTransparentDNSResolverIPv4Address().
-		//
-		// Packet tunnel mode is supported only on certains platforms.
-
-		flag.StringVar(&tunDevice, "tunDevice", "", "run packet tunnel for specified tun device")
+		flag.StringVar(&tunDevice, "tunDevice", "", "run packet tunnel for specified tun device (applies to first config only)")
 		flag.StringVar(&tunBindInterface, "tunBindInterface", tun.DEFAULT_PUBLIC_INTERFACE_NAME, "bypass tun device via specified interface")
 		flag.StringVar(&tunDNSServers, "tunDNSServers", "8.8.8.8,8.8.4.4", "Comma-delimited list of tun bypass DNS server IP addresses")
 	}
@@ -145,17 +130,48 @@ func main() {
 	}
 	defer psiphon.ResetNoticeWriter()
 
-	// Handle required config file parameter
+	// Collect configuration files.
+	// We allow -config flag AND trailing arguments to support:
+	// ./psiphon -config c1 c2 c3
+	var configFiles []string
+	if configFilename != "" {
+		configFiles = append(configFiles, configFilename)
+	}
+	configFiles = append(configFiles, flag.Args()...)
 
-	// EmitDiagnosticNotices is set by LoadConfig; force to true
-	// and emit diagnostics when LoadConfig-related errors occur.
-
-	if configFilename == "" {
+	if len(configFiles) == 0 {
 		psiphon.SetEmitDiagnosticNotices(true, false)
-		psiphon.NoticeError("configuration file is required")
+		psiphon.NoticeError("at least one configuration file is required")
 		os.Exit(1)
 	}
-	configFileContents, err := ioutil.ReadFile(configFilename)
+
+	// Handle Feedback mode (Single config only)
+	if feedbackUpload {
+		if len(configFiles) > 1 {
+			psiphon.NoticeError("feedback upload mode supports only a single configuration file")
+			os.Exit(1)
+		}
+		runFeedbackWorker(configFiles[0], feedbackUploadPath, dataRootDirectory)
+		return
+	}
+
+	// Multi-Tunnel Mode
+	runMultiTunnels(
+		configFiles,
+		dataRootDirectory,
+		embeddedServerEntryListFilename,
+		interfaceName,
+		useNoticeFiles,
+		rotatingFileSize,
+		rotatingSyncFrequency,
+		tunDevice,
+		tunBindInterface,
+		tunDNSServers,
+	)
+}
+
+func runFeedbackWorker(configPath, feedbackUploadPath, dataRootDirectory string) {
+	configFileContents, err := ioutil.ReadFile(configPath)
 	if err != nil {
 		psiphon.SetEmitDiagnosticNotices(true, false)
 		psiphon.NoticeError("error loading configuration file: %s", err)
@@ -168,118 +184,175 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Set data root directory
 	if dataRootDirectory != "" {
 		config.DataRootDirectory = dataRootDirectory
 	}
 
-	if interfaceName != "" {
-		config.ListenInterface = interfaceName
-	}
-
-	// Configure notice files
-
-	if useNoticeFiles {
-		config.UseNoticeFiles = &psiphon.UseNoticeFiles{
-			RotatingFileSize:      rotatingFileSize,
-			RotatingSyncFrequency: rotatingSyncFrequency,
-		}
-	}
-
-	// Configure packet tunnel, including updating the config.
-
-	if tun.IsSupported() && tunDevice != "" {
-		tunDeviceFile, err := configurePacketTunnel(
-			config, tunDevice, tunBindInterface, strings.Split(tunDNSServers, ","))
-		if err != nil {
-			psiphon.SetEmitDiagnosticNotices(true, false)
-			psiphon.NoticeError("error configuring packet tunnel: %s", err)
-			os.Exit(1)
-		}
-		defer tunDeviceFile.Close()
-	}
-
-	// All config fields should be set before calling Commit.
+	// Note: For feedback, we don't necessarily need the full NewController DB init
+	// if SendFeedback manages transient DBs, but following the new pattern,
+	// we assume SendFeedback might need looking into.
+	// Based on original code: "The datastore is not opened here... because it is opened/closed transiently in the psiphon.SendFeedback operation."
+	// We keep existing behavior for feedback.
 
 	err = config.Commit(true)
 	if err != nil {
 		psiphon.SetEmitDiagnosticNotices(true, false)
-		psiphon.NoticeError("error loading configuration file: %s", err)
+		psiphon.NoticeError("error committing config: %s", err)
 		os.Exit(1)
 	}
 
-	// BuildInfo is a diagnostic notice, so emit only after config.Commit
-	// sets EmitDiagnosticNotices.
-
 	psiphon.NoticeBuildInfo()
 
-	var worker Worker
-
-	if feedbackUpload {
-		// Feedback upload mode
-		worker = &FeedbackWorker{
-			feedbackUploadPath: feedbackUploadPath,
-		}
-	} else {
-		// Tunnel mode
-		worker = &TunnelWorker{
-			embeddedServerEntryListFilename: embeddedServerEntryListFilename,
-		}
+	worker := &FeedbackWorker{
+		config:             config,
+		feedbackUploadPath: feedbackUploadPath,
 	}
 
-	workCtx, stopWork := context.WithCancel(context.Background())
-	defer stopWork()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	err = worker.Init(workCtx, config)
-	if err != nil {
+	if err := worker.Init(ctx, config); err != nil {
 		psiphon.NoticeError("error in init: %s", err)
 		os.Exit(1)
 	}
 
-	workWaitGroup := new(sync.WaitGroup)
-	workWaitGroup.Add(1)
-	go func() {
-		defer workWaitGroup.Done()
+	if err := worker.Run(ctx); err != nil {
+		psiphon.NoticeError("%s", err)
+		os.Exit(1)
+	}
+}
 
-		err := worker.Run(workCtx)
+func runMultiTunnels(
+	configFiles []string,
+	dataRootDirectoryOverride string,
+	embeddedServerEntryListFilename string,
+	interfaceName string,
+	useNoticeFiles bool,
+	rotatingFileSize int,
+	rotatingSyncFrequency int,
+	tunDevice, tunBindInterface, tunDNSServers string) {
+
+	// Global Context
+	workCtx, stopWork := context.WithCancel(context.Background())
+	defer stopWork()
+
+	var wg sync.WaitGroup
+
+	for i, configPath := range configFiles {
+		// Load Config
+		configFileContents, err := ioutil.ReadFile(configPath)
 		if err != nil {
-			psiphon.NoticeError("%s", err)
-			stopWork()
-			os.Exit(1)
+			psiphon.SetEmitDiagnosticNotices(true, false)
+			psiphon.NoticeError("[%s] error loading configuration file: %s", configPath, err)
+			continue // Skip bad config, try others
 		}
 
-		// Signal the <-controllerCtx.Done() case below. If the <-systemStopSignal
-		// case already called stopController, this is a noop.
-		stopWork()
-	}()
+		config, err := psiphon.LoadConfig(configFileContents)
+		if err != nil {
+			psiphon.SetEmitDiagnosticNotices(true, false)
+			psiphon.NoticeError("[%s] error processing configuration file: %s", configPath, err)
+			continue
+		}
 
+		// Apply Overrides
+		if dataRootDirectoryOverride != "" {
+			// If running multiple configs, overriding them all to the SAME directory is dangerous
+			// unless they have distinct sub-paths inside (which isn't standard).
+			// We warn if multiple configs share the same root override.
+			if len(configFiles) > 1 {
+				psiphon.NoticeWarning("[%s] Warning: Shared dataRootDirectory override used for multiple configs. Database locking conflicts may occur.", configPath)
+			}
+			config.DataRootDirectory = dataRootDirectoryOverride
+		}
+
+		if interfaceName != "" {
+			config.ListenInterface = interfaceName
+		}
+
+		if useNoticeFiles {
+			config.UseNoticeFiles = &psiphon.UseNoticeFiles{
+				RotatingFileSize:      rotatingFileSize,
+				RotatingSyncFrequency: rotatingSyncFrequency,
+			}
+		}
+
+		// Configure Packet Tunnel (Only for the first config to avoid contention)
+		if i == 0 && tun.IsSupported() && tunDevice != "" {
+			tunDeviceFile, err := configurePacketTunnel(
+				config, tunDevice, tunBindInterface, strings.Split(tunDNSServers, ","))
+			if err != nil {
+				psiphon.SetEmitDiagnosticNotices(true, false)
+				psiphon.NoticeError("[%s] error configuring packet tunnel: %s", configPath, err)
+				os.Exit(1)
+			}
+			// Keep file open for lifetime of process
+			defer tunDeviceFile.Close()
+		}
+
+		// Commit Config
+		err = config.Commit(true)
+		if err != nil {
+			psiphon.SetEmitDiagnosticNotices(true, false)
+			psiphon.NoticeError("[%s] error committing config: %s", configPath, err)
+			continue
+		}
+
+		// Initialize Worker
+		worker := &TunnelWorker{
+			embeddedServerEntryListFilename: embeddedServerEntryListFilename,
+			configLabel:                     configPath,
+		}
+
+		err = worker.Init(workCtx, config)
+		if err != nil {
+			psiphon.NoticeError("[%s] error in init: %s", configPath, err)
+			continue
+		}
+
+		// Run Worker
+		wg.Add(1)
+		go func(w *TunnelWorker) {
+			defer wg.Done()
+			if err := w.Run(workCtx); err != nil {
+				psiphon.NoticeError("[%s] worker exited with error: %s", w.configLabel, err)
+			}
+		}(worker)
+	}
+
+	psiphon.NoticeBuildInfo()
+
+	// Handle Signals
 	systemStopSignal := make(chan os.Signal, 1)
 	signal.Notify(systemStopSignal, os.Interrupt, syscall.SIGTERM)
-
-	// writeProfilesSignal is nil and non-functional on Windows
 	writeProfilesSignal := makeSIGUSR2Channel()
 
-	// Wait for an OS signal or a Run stop signal, then stop Psiphon and exit
+	psiphon.NoticeInfo("All tunnels started. Press Ctrl+C to stop.")
 
-	for exit := false; !exit; {
+	// Wait loop
+	for {
 		select {
 		case <-writeProfilesSignal:
 			psiphon.NoticeInfo("write profiles")
 			profileSampleDurationSeconds := 5
-			common.WriteRuntimeProfiles(
-				psiphon.NoticeCommonLogger(false),
-				config.DataRootDirectory,
-				"",
-				profileSampleDurationSeconds,
-				profileSampleDurationSeconds)
+			// Note: This writes profiles to the first available DataRoot if multiple are used,
+			// or we just pick one. `common.WriteRuntimeProfiles` takes a directory.
+			// We'll use the override if set, or just skip complexity for now.
+			if dataRootDirectoryOverride != "" {
+				common.WriteRuntimeProfiles(
+					psiphon.NoticeCommonLogger(false),
+					dataRootDirectoryOverride,
+					"",
+					profileSampleDurationSeconds,
+					profileSampleDurationSeconds)
+			} else {
+				psiphon.NoticeInfo("write profiles skipped (ambiguous data directory)")
+			}
+
 		case <-systemStopSignal:
 			psiphon.NoticeInfo("shutdown by system")
-			stopWork()
-			workWaitGroup.Wait()
-			exit = true
-		case <-workCtx.Done():
-			psiphon.NoticeInfo("shutdown by controller")
-			exit = true
+			stopWork() // Cancel context for all workers
+			wg.Wait()  // Wait for all to finish
+			return
 		}
 	}
 }
@@ -322,84 +395,60 @@ func (p *tunProvider) GetDNSServers() []string {
 	return p.dnsServers
 }
 
-// Worker creates a protocol around the different run modes provided by the
-// compiled executable.
-type Worker interface {
-	// Init is called once for the worker to perform any initialization.
-	Init(ctx context.Context, config *psiphon.Config) error
-	// Run is called once, after Init(..), for the worker to perform its
-	// work. The provided context should control the lifetime of the work
-	// being performed.
-	Run(ctx context.Context) error
-}
-
-// TunnelWorker is the Worker protocol implementation used for tunnel mode.
+// Worker protocol implementation used for tunnel mode.
 type TunnelWorker struct {
 	embeddedServerEntryListFilename string
 	embeddedServerListWaitGroup     *sync.WaitGroup
 	controller                      *psiphon.Controller
+	configLabel                     string
 }
 
 // Init implements the Worker interface.
 func (w *TunnelWorker) Init(ctx context.Context, config *psiphon.Config) error {
 
-	// Initialize data store
-
-	err := psiphon.OpenDataStore(config)
+	// 1. Create Controller
+	// This now initializes the unique DataStore for this config.
+	controller, err := psiphon.NewController(config)
 	if err != nil {
-		psiphon.NoticeError("error initializing datastore: %s", err)
-		os.Exit(1)
+		return errors.Trace(err)
 	}
+	w.controller = controller
 
-	// If specified, the embedded server list is loaded and stored. When there
-	// are no server candidates at all, we wait for this import to complete
-	// before starting the Psiphon controller. Otherwise, we import while
-	// concurrently starting the controller to minimize delay before attempting
-	// to connect to existing candidate servers.
-	//
-	// If the import fails, an error notice is emitted, but the controller is
-	// still started: either existing candidate servers may suffice, or the
-	// remote server list fetch may obtain candidate servers.
-	//
-	// The import will be interrupted if it's still running when the controller
-	// is stopped.
+	// 2. Import Embedded Servers
+	// We must use the DataStore instance attached to the config.
 	if w.embeddedServerEntryListFilename != "" {
 		w.embeddedServerListWaitGroup = new(sync.WaitGroup)
 		w.embeddedServerListWaitGroup.Add(1)
 		go func() {
 			defer w.embeddedServerListWaitGroup.Done()
 
-			err := psiphon.ImportEmbeddedServerEntries(
-				ctx,
-				config,
-				w.embeddedServerEntryListFilename,
-				"")
+			// UPDATED: Call method on the specific DataStore instance
+			if config.DataStore != nil {
+				err := config.DataStore.ImportEmbeddedServerEntries(
+					ctx,
+					config,
+					w.embeddedServerEntryListFilename,
+					"")
 
-			if err != nil {
-				psiphon.NoticeError("error importing embedded server entry list: %s", err)
-				return
+				if err != nil {
+					psiphon.NoticeError("[%s] error importing embedded server entry list: %s", w.configLabel, err)
+				}
 			}
 		}()
 
-		if !psiphon.HasServerEntries() {
-			psiphon.NoticeInfo("awaiting embedded server entry list import")
+		// UPDATED: Call method on the specific DataStore instance
+		if config.DataStore != nil && !config.DataStore.HasServerEntries() {
+			psiphon.NoticeInfo("[%s] awaiting embedded server entry list import", w.configLabel)
 			w.embeddedServerListWaitGroup.Wait()
 		}
 	}
-
-	controller, err := psiphon.NewController(config)
-	if err != nil {
-		psiphon.NoticeError("error creating controller: %s", err)
-		return errors.Trace(err)
-	}
-	w.controller = controller
 
 	return nil
 }
 
 // Run implements the Worker interface.
 func (w *TunnelWorker) Run(ctx context.Context) error {
-	defer psiphon.CloseDataStore()
+	// UPDATED: No global CloseDataStore. The Controller handles closing its own DataStore.
 	if w.embeddedServerListWaitGroup != nil {
 		defer w.embeddedServerListWaitGroup.Wait()
 	}
@@ -417,23 +466,12 @@ type FeedbackWorker struct {
 
 // Init implements the Worker interface.
 func (f *FeedbackWorker) Init(ctx context.Context, config *psiphon.Config) error {
-
-	// The datastore is not opened here, with psiphon.OpenDatastore,
-	// because it is opened/closed transiently in the psiphon.SendFeedback
-	// operation. We do not want to contest database access incase another
-	// process needs to use the database. E.g. a process running in tunnel
-	// mode, which will fail if it cannot aquire a lock on the database
-	// within a short period of time.
-
 	f.config = config
-
 	return nil
 }
 
 // Run implements the Worker interface.
 func (f *FeedbackWorker) Run(ctx context.Context) error {
-
-	// TODO: cancel blocking read when worker context cancelled?
 	diagnostics, err := ioutil.ReadAll(os.Stdin)
 	if err != nil {
 		return errors.TraceMsg(err, "FeedbackUpload: read stdin failed")

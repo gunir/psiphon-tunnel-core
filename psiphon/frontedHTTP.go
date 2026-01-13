@@ -22,6 +22,7 @@ import (
 // to create a net/http.Client, which is configured to use domain fronting.
 // frontedHTTPClientInstance implements HTTP client dial replay.
 type frontedHTTPClientInstance struct {
+	config                        *Config // ADDED: needed for DataStore access
 	frontedHTTPDialParameters     *frontedHTTPDialParameters
 	networkID                     string
 	replayEnabled                 bool
@@ -51,10 +52,6 @@ func newFrontedHTTPClientInstance(
 	if len(frontingSpecs) == 0 {
 		return nil, errors.TraceNew("no fronting specs")
 	}
-
-	// This function duplicates some code from NewInproxyBrokerClientInstance.
-	//
-	// TODO: merge common functionality?
 
 	p := config.GetParameters().Get()
 	defer p.Close()
@@ -89,21 +86,25 @@ func newFrontedHTTPClientInstance(
 	if replayEnabled {
 		selectFirstCandidate := false
 		var err error
-		spec, dialParams, err =
-			SelectCandidateWithNetworkReplayParameters[parameters.FrontingSpec, frontedHTTPDialParameters](
-				networkID,
-				selectFirstCandidate,
-				frontingSpecs,
-				func(spec *parameters.FrontingSpec) string { return spec.FrontingProviderID },
-				func(spec *parameters.FrontingSpec, dialParams *frontedHTTPDialParameters) bool {
-					// Replay the successful fronting spec, if present, by
-					// comparing its hash with that of the candidate.
-					return dialParams.LastUsedTimestamp.After(now.Add(-ttl)) &&
-						bytes.Equal(dialParams.LastUsedFrontingSpecHash, hashFrontingSpec(spec))
-				})
-		if err != nil {
-			NoticeWarning("SelectCandidateWithNetworkReplayParameters failed: %v", errors.Trace(err))
-			// Continue without replay
+		// MODIFIED: Pass config.DataStore as the first argument
+		if config.DataStore != nil {
+			spec, dialParams, err =
+				SelectCandidateWithNetworkReplayParameters[parameters.FrontingSpec, frontedHTTPDialParameters](
+					config.DataStore,
+					networkID,
+					selectFirstCandidate,
+					frontingSpecs,
+					func(spec *parameters.FrontingSpec) string { return spec.FrontingProviderID },
+					func(spec *parameters.FrontingSpec, dialParams *frontedHTTPDialParameters) bool {
+						// Replay the successful fronting spec, if present, by
+						// comparing its hash with that of the candidate.
+						return dialParams.LastUsedTimestamp.After(now.Add(-ttl)) &&
+							bytes.Equal(dialParams.LastUsedFrontingSpecHash, hashFrontingSpec(spec))
+					})
+			if err != nil {
+				NoticeWarning("SelectCandidateWithNetworkReplayParameters failed: %v", errors.Trace(err))
+				// Continue without replay
+			}
 		}
 	}
 
@@ -151,6 +152,7 @@ func newFrontedHTTPClientInstance(
 	}
 
 	return &frontedHTTPClientInstance{
+		config:                    config, // ADDED
 		networkID:                 networkID,
 		frontedHTTPDialParameters: dialParams,
 		replayEnabled:             replayEnabled,
@@ -277,8 +279,15 @@ func (f *frontedHTTPClientInstance) frontedHTTPClientRoundTripperSucceeded() {
 
 		replayID := f.frontedHTTPDialParameters.FrontedMeekDialParameters.FrontingProviderID
 
-		err := SetNetworkReplayParameters[frontedHTTPDialParameters](
-			f.networkID, replayID, f.frontedHTTPDialParameters)
+		// MODIFIED: Pass f.config.DataStore
+		var err error
+		if f.config.DataStore != nil {
+			err = SetNetworkReplayParameters[frontedHTTPDialParameters](
+				f.config.DataStore, f.networkID, replayID, f.frontedHTTPDialParameters)
+		} else {
+			err = errors.TraceNew("DataStore not available")
+		}
+
 		if err != nil {
 			NoticeWarning("SetNetworkReplayParameters failed: %v", errors.Trace(err))
 			// Continue without persisting replay changes.
@@ -302,18 +311,17 @@ func (f *frontedHTTPClientInstance) frontedHTTPClientRoundTripperFailed() {
 	if f.replayEnabled &&
 		!prng.FlipWeightedCoin(f.replayRetainFailedProbability) {
 
-		// Limitation: there's a race condition with multiple
-		// frontedHTTPClientInstances writing to the replay datastore, such as
-		// in the case where there's a feedback upload running concurrently
-		// with a server list download; this delete could potentially clobber a
-		// concurrent fresh replay store after a success.
-		//
-		// TODO: add an additional storage key distinguisher for each instance?
-
 		replayID := f.frontedHTTPDialParameters.FrontedMeekDialParameters.FrontingProviderID
 
-		err := DeleteNetworkReplayParameters[frontedHTTPDialParameters](
-			f.networkID, replayID)
+		// MODIFIED: Pass f.config.DataStore
+		var err error
+		if f.config.DataStore != nil {
+			err = DeleteNetworkReplayParameters[frontedHTTPDialParameters](
+				f.config.DataStore, f.networkID, replayID)
+		} else {
+			err = errors.TraceNew("DataStore not available")
+		}
+
 		if err != nil {
 			NoticeWarning("DeleteNetworkReplayParameters failed: %v", errors.Trace(err))
 			// Continue without resetting replay.

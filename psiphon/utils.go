@@ -193,8 +193,12 @@ func emitMemoryMetrics() {
 		common.FormatByteCount(memStats.TotalAlloc))
 }
 
-func emitDatastoreMetrics() {
-	NoticeInfo("Datastore metrics at %s: %s", stacktrace.GetParentFunctionName(), GetDataStoreMetrics())
+func emitDatastoreMetrics(ds *DataStore) {
+	// MODIFIED: Takes DataStore as argument and checks for nil
+	if ds == nil {
+		return
+	}
+	NoticeInfo("Datastore metrics at %s: %s", stacktrace.GetParentFunctionName(), ds.GetDataStoreMetrics())
 }
 
 func emitDNSMetrics(resolver *resolver.Resolver) {

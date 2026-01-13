@@ -119,6 +119,16 @@ func NewController(config *Config) (controller *Controller, err error) {
 		return nil, errors.TraceNew("uncommitted config")
 	}
 
+	// --- NEW CODE START ---
+	// Initialize the isolated DataStore for this specific config.
+	// This replaces the global OpenDataStore call that was previously implicit or external.
+	ds, err := NewDataStore(config)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	config.DataStore = ds
+	// --- NEW CODE END ---
+
 	// Needed by regen, at least
 	rand.Seed(int64(time.Now().Nanosecond()))
 
@@ -314,6 +324,11 @@ func (controller *Controller) Run(ctx context.Context) {
 
 	runCtx, stopRunning := context.WithCancel(ctx)
 	defer stopRunning()
+
+	// --- NEW CODE START ---
+	// Ensure the isolated DataStore is closed when this controller stops.
+	defer controller.config.DataStore.Close()
+	// --- NEW CODE END ---
 
 	controller.runCtx = runCtx
 	controller.stopRunning = stopRunning
@@ -870,7 +885,8 @@ loop:
 
 		startTime := time.Now()
 
-		err := ScanServerEntries(callback)
+		// MODIFIED: Use controller.config.DataStore
+		err := controller.config.DataStore.ScanServerEntries(callback)
 		if err != nil {
 			NoticeWarning("ScanServerEntries failed: %v", errors.Trace(err))
 			continue
@@ -1267,7 +1283,10 @@ func (controller *Controller) SignalSeededNewSLOK() {
 	//
 	// TODO: launch an immediate tunneled DSL request?
 
-	_ = DSLSetLastTunneledFetchTime(time.Time{})
+	// MODIFIED: Use controller.config.DataStore
+	if controller.config.DataStore != nil {
+		_ = controller.config.DataStore.DSLSetLastTunneledFetchTime(time.Time{})
+	}
 }
 
 // SignalTunnelFailure implements the TunnelOwner interface. This function
@@ -1324,7 +1343,8 @@ func (controller *Controller) registerTunnel(tunnel *Tunnel) bool {
 	// Connecting to a TargetServerEntry does not change the
 	// ranking.
 	if controller.config.TargetServerEntry == "" {
-		err := PromoteServerEntry(controller.config, tunnel.dialParams.ServerEntry.IpAddress)
+		// MODIFIED: Use controller.config.DataStore
+		err := controller.config.DataStore.PromoteServerEntry(controller.config, tunnel.dialParams.ServerEntry.IpAddress)
 		if err != nil {
 			NoticeWarning("PromoteServerEntry failed: %v", errors.Trace(err))
 			// Proceed with using tunnel
@@ -2280,7 +2300,8 @@ func (controller *Controller) doConstraintsScan() {
 	}
 
 	startTime := time.Now()
-	scanErr := ScanServerEntries(callback)
+	// MODIFIED: Use controller.config.DataStore
+	scanErr := controller.config.DataStore.ScanServerEntries(callback)
 	if scanErr != nil && !scanCancelled {
 		NoticeWarning("ScanServerEntries failed: %v", errors.Trace(scanErr))
 		// Continue and make adjustments based on any partial results.
@@ -2367,7 +2388,8 @@ func (controller *Controller) stopEstablishing() {
 	// Record datastore metrics after establishment, the phase which generates
 	// the bulk of all datastore transactions: iterating over server entries,
 	// storing new server entries, etc.
-	emitDatastoreMetrics()
+    // MODIFIED: Pass controller.config.DataStore
+	emitDatastoreMetrics(controller.config.DataStore)
 
 	// Similarly, establishment generates the bulk of domain resolves.
 	emitDNSMetrics(controller.resolver)
@@ -2575,7 +2597,8 @@ loop:
 				if candidateServerEntryCount == 0 {
 					stopWaiting := false
 					for {
-						if HasServerEntries() {
+						// MODIFIED: Use controller.config.DataStore
+						if controller.config.DataStore.HasServerEntries() {
 							stopWaiting = true
 						}
 						common.SleepWithContext(controller.establishCtx, 1*time.Second)
@@ -2601,8 +2624,10 @@ loop:
 		p := controller.config.GetParameters().Get()
 
 		pausePeriod := p.Duration(parameters.EstablishTunnelPausePeriod)
+		
+		// MODIFIED: Use controller.config.DataStore
 		if controller.config.TargetServerEntry == "" &&
-			GetLastServerEntryCount() == 0 &&
+			controller.config.DataStore.GetLastServerEntryCount() == 0 &&
 			((!controller.config.DisableRemoteServerListFetcher &&
 				(controller.config.RemoteServerListURLs != nil ||
 					controller.config.ObfuscatedServerListRootURLs != nil)) ||

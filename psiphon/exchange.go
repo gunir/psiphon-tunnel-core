@@ -141,8 +141,12 @@ func exportExchangePayload(config *Config) (string, error) {
 		return "", errors.Trace(err)
 	}
 
+	// MODIFIED: Use config.DataStore
+	if config.DataStore == nil {
+		return "", errors.TraceNew("DataStore not initialized")
+	}
 	serverEntryFields, dialParams, err :=
-		GetAffinityServerEntryAndDialParameters(networkID)
+		config.DataStore.GetAffinityServerEntryAndDialParameters(networkID)
 	if err != nil {
 		return "", errors.Trace(err)
 	}
@@ -248,12 +252,17 @@ func importExchangePayload(config *Config, encodedPayload string) error {
 	//
 	// TODO: refactor existing code to allow reuse in a single transaction?
 
-	err = StoreServerEntry(payload.ServerEntryFields, true)
+	// MODIFIED: Use config.DataStore for all DB operations
+	if config.DataStore == nil {
+		return errors.TraceNew("DataStore not initialized")
+	}
+
+	err = config.DataStore.StoreServerEntry(payload.ServerEntryFields, true)
 	if err != nil {
 		return errors.Trace(err)
 	}
 
-	err = PromoteServerEntry(config, payload.ServerEntryFields.GetIPAddress())
+	err = config.DataStore.PromoteServerEntry(config, payload.ServerEntryFields.GetIPAddress())
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -279,7 +288,7 @@ func importExchangePayload(config *Config, encodedPayload string) error {
 				config.GetParameters().Get(),
 				serverEntry)
 
-			err = SetDialParameters(
+			err = config.DataStore.SetDialParameters(
 				payload.ServerEntryFields.GetIPAddress(),
 				networkID,
 				dialParams)

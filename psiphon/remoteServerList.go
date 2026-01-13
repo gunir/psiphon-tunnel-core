@@ -109,7 +109,11 @@ func FetchCommonRemoteServerList(
 	// NewAuthenticatedDataPackageReader authenticates the file before returning.
 	authenticatedDownload = true
 
-	err = StreamingStoreServerEntries(
+	if config.DataStore == nil {
+		return errors.TraceNew("DataStore not initialized")
+	}
+
+	err = config.DataStore.StreamingStoreServerEntries(
 		ctx,
 		config,
 		protocol.NewStreamingServerEntryDecoder(
@@ -123,7 +127,7 @@ func FetchCommonRemoteServerList(
 
 	// Now that the server entries are successfully imported, store the response
 	// ETag so we won't re-download this same data again.
-	err = SetUrlETag(canonicalURL, newETag)
+	err = config.DataStore.SetUrlETag(canonicalURL, newETag)
 	if err != nil {
 		NoticeWarning("failed to set ETag for common remote server list: %s", errors.Trace(err))
 		// This fetch is still reported as a success, even if we can't store the etag
@@ -153,6 +157,10 @@ func FetchObfuscatedServerLists(
 
 	NoticeInfo("fetching obfuscated remote server lists")
 
+	if config.DataStore == nil {
+		return errors.TraceNew("DataStore not initialized")
+	}
+
 	p := config.GetParameters().Get()
 	publicKey := p.String(parameters.RemoteServerListSignaturePublicKey)
 	urls := p.TransferURLs(parameters.ObfuscatedServerListRootURLs)
@@ -171,7 +179,7 @@ func FetchObfuscatedServerLists(
 	// the registry, so clear the ETag to ensure that always happens.
 	_, err := os.Stat(cachedFilename)
 	if os.IsNotExist(err) {
-		err := SetUrlETag(canonicalURL, "")
+		err := config.DataStore.SetUrlETag(canonicalURL, "")
 		if err != nil {
 			NoticeWarning("SetUrlETag failed: %v", errors.Trace(err))
 			// Continue
@@ -227,7 +235,8 @@ func FetchObfuscatedServerLists(
 
 	lookupSLOKs := func(slokID []byte) []byte {
 		// Lookup SLOKs in local datastore
-		key, err := GetSLOK(slokID)
+		// MODIFIED: Use config.DataStore
+		key, err := config.DataStore.GetSLOK(slokID)
 		if err != nil && atomic.CompareAndSwapInt32(&emittedGetSLOKAlert, 0, 1) {
 			NoticeWarning("GetSLOK failed: %s", err)
 		}
@@ -309,7 +318,7 @@ func FetchObfuscatedServerLists(
 			// This fetch is still reported as a success, even if we can't update the cache
 		}
 
-		err = SetUrlETag(canonicalURL, newETag)
+		err = config.DataStore.SetUrlETag(canonicalURL, newETag)
 		if err != nil {
 			NoticeWarning("failed to set ETag for obfuscated server list registry: %s", errors.Trace(err))
 			// This fetch is still reported as a success, even if we can't store the ETag
@@ -338,6 +347,11 @@ func downloadOSLFileSpec(
 	publicKey string,
 	lookupSLOKs func(slokID []byte) []byte,
 	oslFileSpec *osl.OSLFileSpec) bool {
+
+	if config.DataStore == nil {
+		NoticeWarning("DataStore not initialized")
+		return false
+	}
 
 	downloadFilename := osl.GetOSLFilename(
 		config.GetObfuscatedServerListDownloadDirectory(), oslFileSpec.ID)
@@ -400,7 +414,7 @@ func downloadOSLFileSpec(
 	// NewOSLReader authenticates the file before returning.
 	authenticatedDownload = true
 
-	err = StreamingStoreServerEntries(
+	err = config.DataStore.StreamingStoreServerEntries(
 		ctx,
 		config,
 		protocol.NewStreamingServerEntryDecoder(
@@ -415,7 +429,7 @@ func downloadOSLFileSpec(
 
 	// Now that the server entries are successfully imported, store the response
 	// ETag so we won't re-download this same data again.
-	err = SetUrlETag(canonicalURL, newETag)
+	err = config.DataStore.SetUrlETag(canonicalURL, newETag)
 	if err != nil {
 		NoticeWarning("failed to set ETag for obfuscated server list file (%s): %s", hexID, errors.Trace(err))
 		// This fetch is still reported as a success, even if we can't store the ETag
@@ -451,9 +465,13 @@ func downloadRemoteServerListFile(
 	sourceETag string,
 	destinationFilename string) (string, func(bool), error) {
 
+	if config.DataStore == nil {
+		return "", nil, errors.TraceNew("DataStore not initialized")
+	}
+
 	// All download URLs with the same canonicalURL
 	// must have the same entity and ETag.
-	lastETag, err := GetUrlETag(canonicalURL)
+	lastETag, err := config.DataStore.GetUrlETag(canonicalURL)
 	if err != nil {
 		return "", nil, errors.Trace(err)
 	}

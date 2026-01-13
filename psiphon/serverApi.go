@@ -346,15 +346,20 @@ func (serverContext *ServerContext) doHandshakeRequest(ignoreStatsRegexps bool) 
 		serverEntries = append(serverEntries, serverEntryFields)
 	}
 
-	err = StoreServerEntries(
-		serverContext.tunnel.config,
-		serverEntries,
-		true)
-	if err != nil {
-		return errors.Trace(err)
+	// MODIFIED: Use config.DataStore
+	if serverContext.tunnel.config.DataStore != nil {
+		err = serverContext.tunnel.config.DataStore.StoreServerEntries(
+			serverContext.tunnel.config,
+			serverEntries,
+			true)
+		if err != nil {
+			return errors.Trace(err)
+		}
 	}
 
-	NoticeHomepages(handshakeResponse.Homepages)
+	// --- MODIFIED: DISABLE ADS (HOMEPAGES) ---
+	// NoticeHomepages(handshakeResponse.Homepages)
+	// -----------------------------------------
 
 	serverContext.clientUpgradeVersion = handshakeResponse.UpgradeClientVersion
 	if handshakeResponse.UpgradeClientVersion != "" {
@@ -504,7 +509,8 @@ func (serverContext *ServerContext) DoConnectedRequest() error {
 	params := serverContext.getBaseAPIParameters(
 		baseParametersOnlyUpstreamFragmentorDialParameters)
 
-	lastConnected, err := getLastConnected()
+	// MODIFIED: Pass config
+	lastConnected, err := getLastConnected(serverContext.tunnel.config)
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -546,17 +552,24 @@ func (serverContext *ServerContext) DoConnectedRequest() error {
 		return errors.Trace(err)
 	}
 
-	err = SetKeyValue(
-		datastoreLastConnectedKey, connectedResponse.ConnectedTimestamp)
-	if err != nil {
-		return errors.Trace(err)
+	// MODIFIED: Use config.DataStore
+	if serverContext.tunnel.config.DataStore != nil {
+		err = serverContext.tunnel.config.DataStore.SetKeyValue(
+			datastoreLastConnectedKey, connectedResponse.ConnectedTimestamp)
+		if err != nil {
+			return errors.Trace(err)
+		}
 	}
 
 	return nil
 }
 
-func getLastConnected() (string, error) {
-	lastConnected, err := GetKeyValue(datastoreLastConnectedKey)
+func getLastConnected(config *Config) (string, error) {
+	// MODIFIED: Use config.DataStore
+	if config.DataStore == nil {
+		return "None", nil
+	}
+	lastConnected, err := config.DataStore.GetKeyValue(datastoreLastConnectedKey)
 	if err != nil {
 		return "", errors.Trace(err)
 	}
@@ -622,7 +635,8 @@ func (serverContext *ServerContext) DoStatusRequest() error {
 		// Resend the transfer stats and tunnel stats later
 		// Note: potential duplicate reports if the server received and processed
 		// the request but the client failed to receive the response.
-		putBackStatusRequestPayload(statusPayloadInfo)
+		// MODIFIED: Pass config
+		putBackStatusRequestPayload(serverContext.tunnel.config, statusPayloadInfo)
 
 		return errors.Trace(err)
 	}
@@ -631,7 +645,8 @@ func (serverContext *ServerContext) DoStatusRequest() error {
 	// persistentStats and transferStats, this clears the reported data as it
 	// is now delivered and doesn't need to be resent.
 
-	confirmStatusRequestPayload(statusPayloadInfo)
+	// MODIFIED: Pass config
+	confirmStatusRequestPayload(serverContext.tunnel.config, statusPayloadInfo)
 
 	var statusResponse protocol.StatusResponse
 	err = json.Unmarshal(response, &statusResponse)
@@ -646,8 +661,11 @@ func (serverContext *ServerContext) DoStatusRequest() error {
 
 	pruneCount := 0
 	for _, serverEntryTag := range statusResponse.InvalidServerEntryTags {
-		if PruneServerEntry(serverContext.tunnel.config, serverEntryTag) {
-			pruneCount++
+		// MODIFIED: Use config.DataStore
+		if serverContext.tunnel.config.DataStore != nil {
+			if serverContext.tunnel.config.DataStore.PruneServerEntry(serverContext.tunnel.config, serverEntryTag) {
+				pruneCount++
+			}
 		}
 	}
 
@@ -670,10 +688,13 @@ func (serverContext *ServerContext) DoStatusRequest() error {
 		// aren't in the check count; if this occurs, it will increase the
 		// ratio and make an immediate re-check more likely, which makes sense.
 
-		UpdateCheckServerEntryTagsEndTime(
-			serverContext.tunnel.config,
-			statusPayloadInfo.checkServerEntryTagCount,
-			pruneCount)
+		// MODIFIED: Use config.DataStore
+		if serverContext.tunnel.config.DataStore != nil {
+			serverContext.tunnel.config.DataStore.UpdateCheckServerEntryTagsEndTime(
+				serverContext.tunnel.config,
+				statusPayloadInfo.checkServerEntryTagCount,
+				pruneCount)
+		}
 	}
 
 	return nil
@@ -707,23 +728,34 @@ func makeStatusRequestPayload(
 	// allowance, and the allowance for persistentStats is reduced by the
 	// size of the prune check data, if any.
 
-	checkServerEntryTags, tagsSize, err := GetCheckServerEntryTags(config)
-	if err != nil {
-		NoticeWarning(
-			"GetCheckServerEntryTags failed: %s", errors.Trace(err))
-		checkServerEntryTags = nil
-		// Proceed with persistentStats/transferStats only
+	// MODIFIED: Use config.DataStore
+	var checkServerEntryTags []string
+	var tagsSize int
+	var err error
+	if config.DataStore != nil {
+		checkServerEntryTags, tagsSize, err = config.DataStore.GetCheckServerEntryTags(config)
+		if err != nil {
+			NoticeWarning(
+				"GetCheckServerEntryTags failed: %s", errors.Trace(err))
+			checkServerEntryTags = nil
+			// Proceed with persistentStats/transferStats only
+		}
 	}
 
 	transferStats := transferstats.TakeOutStatsForServer(serverId)
 	hostBytes := transferStats.GetStatsForStatusRequest()
 
-	persistentStats, statsSize, err := TakeOutUnreportedPersistentStats(config, tagsSize)
-	if err != nil {
-		NoticeWarning(
-			"TakeOutUnreportedPersistentStats failed: %s", errors.Trace(err))
-		persistentStats = nil
-		// Proceed with transferStats only
+	// MODIFIED: Use config.DataStore
+	var persistentStats map[string][][]byte
+	var statsSize int
+	if config.DataStore != nil {
+		persistentStats, statsSize, err = config.DataStore.TakeOutUnreportedPersistentStats(config, tagsSize)
+		if err != nil {
+			NoticeWarning(
+				"TakeOutUnreportedPersistentStats failed: %s", errors.Trace(err))
+			persistentStats = nil
+			// Proceed with transferStats only
+		}
 	}
 
 	if len(checkServerEntryTags) == 0 && len(hostBytes) == 0 && len(persistentStats) == 0 {
@@ -767,7 +799,8 @@ func makeStatusRequestPayload(
 	if err != nil {
 
 		// Send the transfer stats and tunnel stats later
-		putBackStatusRequestPayload(payloadInfo)
+		// MODIFIED: Pass config
+		putBackStatusRequestPayload(config, payloadInfo)
 
 		return nil, nil, errors.Trace(err)
 	}
@@ -779,24 +812,30 @@ func makeStatusRequestPayload(
 	return jsonPayload, payloadInfo, nil
 }
 
-func putBackStatusRequestPayload(payloadInfo *statusRequestPayloadInfo) {
+func putBackStatusRequestPayload(config *Config, payloadInfo *statusRequestPayloadInfo) {
 	transferstats.PutBackStatsForServer(
 		payloadInfo.serverId, payloadInfo.transferStats)
-	err := PutBackUnreportedPersistentStats(payloadInfo.persistentStats)
-	if err != nil {
-		// These persistent stats records won't be resent until after a
-		// datastore re-initialization.
-		NoticeWarning(
-			"PutBackUnreportedPersistentStats failed: %s", errors.Trace(err))
+	// MODIFIED: Use config.DataStore
+	if config.DataStore != nil {
+		err := config.DataStore.PutBackUnreportedPersistentStats(payloadInfo.persistentStats)
+		if err != nil {
+			// These persistent stats records won't be resent until after a
+			// datastore re-initialization.
+			NoticeWarning(
+				"PutBackUnreportedPersistentStats failed: %s", errors.Trace(err))
+		}
 	}
 }
 
-func confirmStatusRequestPayload(payloadInfo *statusRequestPayloadInfo) {
-	err := ClearReportedPersistentStats(payloadInfo.persistentStats)
-	if err != nil {
-		// These persistent stats records may be resent.
-		NoticeWarning(
-			"ClearReportedPersistentStats failed: %s", errors.Trace(err))
+func confirmStatusRequestPayload(config *Config, payloadInfo *statusRequestPayloadInfo) {
+	// MODIFIED: Use config.DataStore
+	if config.DataStore != nil {
+		err := config.DataStore.ClearReportedPersistentStats(payloadInfo.persistentStats)
+		if err != nil {
+			// These persistent stats records may be resent.
+			NoticeWarning(
+				"ClearReportedPersistentStats failed: %s", errors.Trace(err))
+		}
 	}
 }
 
@@ -883,7 +922,12 @@ func RecordRemoteServerListStat(
 		return errors.Trace(err)
 	}
 
-	return StorePersistentStat(
+	// MODIFIED: Use config.DataStore
+	if config.DataStore == nil {
+		return errors.TraceNew("DataStore not initialized")
+	}
+
+	return config.DataStore.StorePersistentStat(
 		config, datastorePersistentStatTypeRemoteServerList, remoteServerListStatJson)
 }
 
@@ -918,7 +962,8 @@ func RecordFailedTunnelStat(
 		return errors.TraceNew("no error")
 	}
 
-	lastConnected, err := getLastConnected()
+	// MODIFIED: Pass config
+	lastConnected, err := getLastConnected(config)
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -959,7 +1004,12 @@ func RecordFailedTunnelStat(
 		return errors.Trace(err)
 	}
 
-	return StorePersistentStat(
+	// MODIFIED: Use config.DataStore
+	if config.DataStore == nil {
+		return errors.TraceNew("DataStore not initialized")
+	}
+
+	return config.DataStore.StorePersistentStat(
 		config, datastorePersistentStatTypeFailedTunnel, failedTunnelStatJson)
 }
 
@@ -1432,9 +1482,12 @@ func getBaseAPIParameters(
 			}
 		}
 
-		serverEntryCount := GetLastServerEntryCount()
-		if serverEntryCount >= 0 {
-			params["server_entry_count"] = strconv.Itoa(serverEntryCount)
+		// MODIFIED: Use config.DataStore
+		if config.DataStore != nil {
+			serverEntryCount := config.DataStore.GetLastServerEntryCount()
+			if serverEntryCount >= 0 {
+				params["server_entry_count"] = strconv.Itoa(serverEntryCount)
+			}
 		}
 
 	} else if filter == baseParametersOnlyUpstreamFragmentorDialParameters {
@@ -1581,22 +1634,29 @@ func HandleOSLRequest(
 	}
 
 	if oslRequest.ClearLocalSLOKs {
-		err := DeleteSLOKs()
-		if err != nil {
-			NoticeWarning("DeleteSLOKs failed: %v", errors.Trace(err))
-			// Continue
+		// MODIFIED: Use config.DataStore
+		if tunnel.config.DataStore != nil {
+			err := tunnel.config.DataStore.DeleteSLOKs()
+			if err != nil {
+				NoticeWarning("DeleteSLOKs failed: %v", errors.Trace(err))
+				// Continue
+			}
 		}
 	}
 
 	seededNewSLOK := false
 
 	for _, slok := range oslRequest.SeedPayload.SLOKs {
-		duplicate, err := SetSLOK(slok.ID, slok.Key)
-		if err != nil {
-			// TODO: return error to trigger retry?
-			NoticeWarning("SetSLOK failed: %v", errors.Trace(err))
-		} else if !duplicate {
-			seededNewSLOK = true
+		// MODIFIED: Use config.DataStore
+		var duplicate bool
+		if tunnel.config.DataStore != nil {
+			duplicate, err = tunnel.config.DataStore.SetSLOK(slok.ID, slok.Key)
+			if err != nil {
+				// TODO: return error to trigger retry?
+				NoticeWarning("SetSLOK failed: %v", errors.Trace(err))
+			} else if !duplicate {
+				seededNewSLOK = true
+			}
 		}
 
 		if tunnel.config.EmitSLOKs {

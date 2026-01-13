@@ -72,6 +72,9 @@ type DialParameters struct {
 	CandidateNumber         int                   `json:"-"`
 	EstablishedTunnelsCount int                   `json:"-"`
 
+	// Reference to the DataStore that manages this DialParameter's persistence.
+	DataStore *DataStore `json:"-"`
+
 	IsExchanged bool `json:",omitempty"`
 
 	LastUsedTimestamp       time.Time `json:",omitempty"`
@@ -267,7 +270,7 @@ func MakeDialParameters(
 
 	// Check for existing dial parameters for this server/network ID.
 
-	dialParams, err := GetDialParameters(
+	dialParams, err := config.DataStore.GetDialParameters(
 		config, serverEntry.IpAddress, networkID)
 	if err != nil {
 		NoticeWarning("GetDialParameters failed: %s", err)
@@ -392,7 +395,7 @@ func MakeDialParameters(
 		// In these cases, existing dial parameters are expired or no longer
 		// match the config state and so are cleared to avoid rechecking them.
 
-		err = DeleteDialParameters(serverEntry.IpAddress, networkID)
+		err = config.DataStore.DeleteDialParameters(serverEntry.IpAddress, networkID)
 		if err != nil {
 			NoticeWarning("DeleteDialParameters failed: %s", err)
 		}
@@ -432,6 +435,9 @@ func MakeDialParameters(
 	if !isReplay {
 		dialParams = &DialParameters{}
 	}
+
+	// Ensure the DataStore reference is set, whether new or retrieved from persistence.
+	dialParams.DataStore = config.DataStore
 
 	if isExchanged {
 		// Set isReplay to false to cause all non-exchanged values to be
@@ -1331,7 +1337,7 @@ func MakeDialParameters(
 
 		} else {
 
-			serverEntryFields, err = GetSignedServerEntryFields(serverEntry.IpAddress)
+			serverEntryFields, err = config.DataStore.GetSignedServerEntryFields(serverEntry.IpAddress)
 			if err != nil {
 				return nil, errors.Trace(err)
 			}
@@ -1442,7 +1448,7 @@ func MakeDialParameters(
 		// prune case is enforced in the server's status request
 		// failed_tunnel processing; see server.statusAPIRequestHandler.
 
-		PruneServerEntry(config, serverEntry.IpAddress)
+		config.DataStore.PruneServerEntry(config, serverEntry.IpAddress)
 		return nil, errors.TraceNew("invalid dial port number")
 	}
 
@@ -1897,9 +1903,15 @@ func (dialParams *DialParameters) Succeeded() {
 	}
 
 	NoticeInfo("Set dial parameters for %s", dialParams.ServerEntry.GetDiagnosticID())
-	err := SetDialParameters(dialParams.ServerEntry.IpAddress, dialParams.NetworkID, dialParams)
-	if err != nil {
-		NoticeWarning("SetDialParameters failed: %s", err)
+
+	// Use the attached DataStore
+	if dialParams.DataStore != nil {
+		err := dialParams.DataStore.SetDialParameters(dialParams.ServerEntry.IpAddress, dialParams.NetworkID, dialParams)
+		if err != nil {
+			NoticeWarning("SetDialParameters failed: %s", err)
+		}
+	} else {
+		NoticeWarning("SetDialParameters skipped: DataStore is nil")
 	}
 }
 
@@ -1943,7 +1955,7 @@ func (dialParams *DialParameters) Failed(config *Config, dialErr error) {
 		(!isInproxyDialErr || !p.WeightedCoinFlip(parameters.InproxyReplayRetainFailedProbability)) {
 
 		NoticeInfo("Delete dial parameters for %s", dialParams.ServerEntry.GetDiagnosticID())
-		err := DeleteDialParameters(dialParams.ServerEntry.IpAddress, dialParams.NetworkID)
+		err := config.DataStore.DeleteDialParameters(dialParams.ServerEntry.IpAddress, dialParams.NetworkID)
 		if err != nil {
 			NoticeWarning("DeleteDialParameters failed: %s", err)
 		}
@@ -2048,6 +2060,7 @@ func (dialParams *ExchangedDialParameters) MakeDialParameters(
 	configStateHash, serverEntryHash := getDialStateHashes(config, p, serverEntry)
 
 	return &DialParameters{
+		DataStore:               config.DataStore,
 		IsExchanged:             true,
 		LastUsedTimestamp:       time.Now(),
 		LastUsedConfigStateHash: configStateHash,
@@ -2055,6 +2068,9 @@ func (dialParams *ExchangedDialParameters) MakeDialParameters(
 		TunnelProtocol:          dialParams.TunnelProtocol,
 	}
 }
+
+// ... [The rest of the file (getDialStateHashes, selectFrontingParameters, etc.) remains unchanged] ...
+// (Omitting helper functions for brevity as they don't use DataStore)
 
 // getDialStateHashes returns two hashes: the config state hash reflects the
 // config dial parameters and tactics tag used for a dial; and the server
